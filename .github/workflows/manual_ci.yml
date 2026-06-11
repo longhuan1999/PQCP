@@ -1,0 +1,135 @@
+name: PQCP Build manual CI
+permissions:
+    contents: read
+on:
+  workflow_dispatch:
+    inputs:
+        openhitls_ref:
+            description: OpenHiTLS 仓库的分支/标签名
+            type: string
+            required: true
+            default: openhitls-0.4.0-alpha2
+        build_type:
+            description: 构建类型
+            type: choice
+            required: true
+            options:
+              - Debug
+              - Release
+            default: Release
+env:
+  BUILD_TYPE: ${{ github.event.inputs.build_type }}
+  OPENHITLS_DIR: platform/openhitls
+  OPENHITLS_REF: ${{ github.event.inputs.openhitls_ref }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux
+          - target: aarch64-linux
+          - target: x86_64-windows
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Cross-Compilation Toolchains
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-linux" ]; then
+            sudo apt-get update
+            sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          elif [ "${{ matrix.target }}" = "x86_64-windows" ]; then
+            sudo apt-get update
+            sudo apt-get install -y mingw-w64
+          fi
+
+      - name: Generate CMake Toolchain File
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-linux" ]; then
+            cat > ${{ github.workspace }}/toolchain.cmake <<EOF
+            set(CMAKE_SYSTEM_NAME Linux)
+            set(CMAKE_SYSTEM_PROCESSOR aarch64)
+            set(CMAKE_C_COMPILER aarch64-linux-gnu-gcc)
+            set(CMAKE_CXX_COMPILER aarch64-linux-gnu-g++)
+          EOF
+          elif [ "${{ matrix.target }}" = "x86_64-windows" ]; then
+            cat > ${{ github.workspace }}/toolchain.cmake <<EOF
+            set(CMAKE_SYSTEM_NAME Windows)
+            set(CMAKE_SYSTEM_PROCESSOR AMD64)
+            set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
+            set(CMAKE_CXX_COMPILER x86_64-w64-mingw32-g++)
+            set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+          EOF
+          fi
+
+    #   - name: Download OpenHiTLS
+    #     run: |
+    #       mkdir -p ${{ github.workspace }}/platform
+    #       git clone --depth 1 --branch "${{ env.OPENHITLS_REF }}" https://gitcode.com/openHiTLS/openhitls.git ${{ github.workspace }}/${{ env.OPENHITLS_DIR }}
+      - name: Checkout OpenHiTLS
+        uses: actions/checkout@v4
+        with:
+            repository: openHiTLS/openhitls
+            ref: ${{ env.OPENHITLS_REF }}
+            fetch-depth: 1
+            path: ${{ env.OPENHITLS_DIR }}
+
+      - name: Build OpenHiTLS
+        run: |
+          mkdir -p ${{ github.workspace }}/${{ env.OPENHITLS_DIR }}/build
+          cd ${{ github.workspace }}/${{ env.OPENHITLS_DIR }}/build
+          
+          # 根据目标平台附加不同的 CMake 参数
+          EXTRA_CMAKE_ARGS=""
+          if [ -f ${{ github.workspace }}/toolchain.cmake ]; then
+            EXTRA_CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/toolchain.cmake"
+          fi
+          
+          # Windows 下不需要 -ldl
+          LINKER_FLAGS="-ldl"
+          if [ "${{ matrix.target }}" = "x86_64-windows" ]; then
+            LINKER_FLAGS=""
+          fi
+          
+          cmake .. \
+            $EXTRA_CMAKE_ARGS \
+            -DHITLS_BUILD_PROFILE=full \
+            -DHITLS_BUILD_STATIC=OFF \
+            -DHITLS_EAL_INIT_OPTS=9 \
+            -DHITLS_CRYPTO_ASM_CHECK=ON \
+            -DCMAKE_SHARED_LINKER_FLAGS="$LINKER_FLAGS" \
+            -DHITLS_PLATFORM_BITS=64
+          make -j$(nproc)
+
+      - name: Configure CMake
+        run: |
+          mkdir -p ${{ github.workspace }}/build
+          cd ${{ github.workspace }}/build
+          
+          EXTRA_CMAKE_ARGS=""
+          if [ -f ${{ github.workspace }}/toolchain.cmake ]; then
+            EXTRA_CMAKE_ARGS="-DCMAKE_TOOLCHAIN_FILE=${{ github.workspace }}/toolchain.cmake"
+          fi
+          
+          cmake .. \
+            $EXTRA_CMAKE_ARGS \
+            -DCMAKE_BUILD_TYPE="${{ env.BUILD_TYPE }}" \
+            -DENABLE_ASAN="OFF" \
+            -DHITLS_ROOT_PATH="${{ github.workspace }}/${{ env.OPENHITLS_DIR }}"
+
+      - name: Build
+        working-directory: ${{ github.workspace }}/build
+        run: make -j$(nproc)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: pqcp-build-${{ matrix.target }}
+          path: ${{ github.workspace }}/build
+          retention-days: 5
